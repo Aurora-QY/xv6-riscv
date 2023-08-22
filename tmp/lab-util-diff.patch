@@ -1,0 +1,384 @@
+diff --git a/Makefile b/Makefile
+index 0fbaf7c..f3e461c 100644
+--- a/Makefile
++++ b/Makefile
+@@ -149,6 +149,11 @@ UPROGS=\
+ 	$U/_grind\
+ 	$U/_wc\
+ 	$U/_zombie\
++	$U/_sleep\
++	$U/_pingpong\
++	$U/_primes\
++	$U/_find\
++	$U/_xargs\
+ 
+ 
+ ifeq ($(LAB),syscall)
+diff --git a/time.txt b/time.txt
+new file mode 100644
+index 0000000..45a4fb7
+--- /dev/null
++++ b/time.txt
+@@ -0,0 +1 @@
++8
+diff --git a/user/find.c b/user/find.c
+new file mode 100644
+index 0000000..79f44d9
+--- /dev/null
++++ b/user/find.c
+@@ -0,0 +1,82 @@
++//xv6=labs-2020 Labs Utilities
++//find
++//参考ls
++#include "kernel/types.h"
++#include "kernel/stat.h"
++#include "user/user.h"
++#include "kernel/fs.h"//文件系统相关头文件,使用相关结构体
++
++char*
++fmtname(char *path)//ls中的函数(更改过),将文件转化为文件名,(例如将"./echo"转化为"echo",find的path就是前者
++{
++  char *p;
++  // Find first character after last slash.
++  for(p=path+strlen(path); p >= path && *p != '/'; p--)
++    ;
++  p++;
++  return p;
++}
++
++void
++find(char *path, char *fileName) {//path为当前目录,fileName为文件名
++  int fd;
++  struct dirent de;//目录项结构体,包括文件名(大小为DIRSIZ=14的char数组)与inum(inode号,类型为ushort)
++  struct stat st;//文件信息结构体(包括文件类型/大小等)
++  char buf[512];
++  char *p;
++
++  if ((fd = open(path, 0)) < 0) {
++    fprintf(2, "Error in find: Failed to open %s.\n", path);
++    return;
++  }
++  if (fstat(fd, &st) < 0) {
++    fprintf(2, "Error in find: Failed to stat %s.\n", path);
++    close(fd);
++    return;
++  }//读取文件及其信息
++
++  switch (st.type) {//判断文件类型
++    case T_FILE://如果是文件,则比较
++      if (!strcmp(fileName, fmtname(path))) {
++        printf("%s\n", path);
++      }
++      break;
++
++    case T_DIR://如果是目录,则进入下级目录搜索
++      if (strlen(path) + 1 + DIRSIZ + 1 > sizeof(buf)) {
++        fprintf(2, "Error in find: path too long\n");
++        break;
++      }
++      strcpy(buf, path);
++      p = buf + strlen(buf);
++      *p++ = '/';//把当前目录复制到buf中并且末尾添加'/'
++
++      // 读取目录中的每一项
++      while (read(fd, &de, sizeof(de)) == sizeof(de)) {
++        if (!de.inum || !strcmp(de.name, ".") || !strcmp(de.name, "..")) {//不递归"."和".."(inum=0是无效目录项)
++          continue;
++        }
++        memmove(p, de.name, DIRSIZ);
++        p[DIRSIZ] = 0;
++        find(buf, fileName);
++      }
++      break;
++  }
++
++  close(fd);
++}
++
++int
++main(int argc, char* argv[]) {
++  if (argc < 2 || argc > 3) {
++    fprintf(2, "Usage: find <path> <fileName>\n");
++    exit(1);
++  } else if(argc == 2){
++    find(".", argv[1]);
++  } else{
++    find(argv[1], argv[2]);
++  }
++  
++  exit(0);
++}
++
+diff --git a/user/pingpong.c b/user/pingpong.c
+new file mode 100644
+index 0000000..7236035
+--- /dev/null
++++ b/user/pingpong.c
+@@ -0,0 +1,56 @@
++//xv6-kabs-2020 Labs Utility
++//pingpong
++#include "kernel/types.h"
++#include "kernel/stat.h"
++#include "user/user.h"
++
++int
++main(void) {
++  char buffer[16];         // 缓冲区
++  int parent_to_child[2];  // 父进程到子进程的管道
++  int child_to_parent[2];  // 子进程到父进程的管道
++
++  //检查管道创建是否出错
++  if (pipe(parent_to_child) < 0 || pipe(child_to_parent) < 0) {
++    fprintf(2, "Error in pingpong: Failed to create pipe.\n");
++    exit(1);
++  }
++
++  int pid = fork();
++  
++  //检查进程创建是否出错
++  if (pid < 0) {
++    fprintf(2, "Error in pingpong: Fork failed.\n");
++    exit(1);
++  }
++
++  if (pid == 0) {// 子进程
++    close(parent_to_child[1]);  // 关闭父进程写端
++    close(child_to_parent[0]);  // 关闭子进程读端
++    
++    read(parent_to_child[0], buffer, strlen("ping"));
++    printf("%d: received %s\n", getpid(), buffer);
++    write(child_to_parent[1], "pong", strlen("pong"));
++
++    close(parent_to_child[0]);  // 关闭父进程读端
++    close(child_to_parent[1]);  // 关闭子进程写端
++  } else {
++    // 父进程
++    close(parent_to_child[0]);  // 关闭父进程读端
++    close(child_to_parent[1]);  // 关闭子进程写端
++
++    write(parent_to_child[1], "ping", strlen("ping"));
++    wait(0);
++    //等到子进程退出
++    read(child_to_parent[0], buffer, strlen("pong"));
++    printf("%d: received %s\n", getpid(), buffer);
++
++    close(parent_to_child[1]);  // 关闭父进程写端
++    close(child_to_parent[0]);  // 关闭子进程读端
++
++    wait(0);  // 等待子进程退出
++  }
++
++  exit(0);
++}
++
+diff --git a/user/primes.c b/user/primes.c
+new file mode 100644
+index 0000000..b5b72de
+--- /dev/null
++++ b/user/primes.c
+@@ -0,0 +1,54 @@
++//xv6-kabs-2020 Labs Utility
++//primes
++//埃氏筛的管道方式实现
++#include "kernel/types.h"
++#include "kernel/stat.h"
++#include "user/user.h"
++
++void
++primes(int read_fd) {//read_fd为上一个进程的读管道文件描述符
++  int top;//当前输出的质数(从管道读入的第一个数)
++  int cur;//后续读入的数
++  int p[2];//管道
++
++  if (read(read_fd, &top, sizeof(int)) > 0) {//如果还有读入
++    printf("prime %d\n", top);
++    pipe(p);
++    int pid = fork();
++    if (pid < 0) {//进程创建失败
++      fprintf(2, "Error in primes: Fork failed.\n");
++      exit(0);
++    } else if (pid == 0) {//子进程
++      close(p[0]);//子进程不需要读管道
++      while (read(read_fd, &cur, sizeof(int)) > 0) {
++        if (cur % top != 0) {//筛选并写入管道
++          write(p[1], &cur, sizeof(int));
++        }
++      }
++      close(p[1]);
++    } else {//父进程
++      close(p[1]);//父进程不需要用到写管道
++      wait(0);
++      primes(p[0]);//将管道读端作为参数传入函数
++      close(p[0]);//关闭父进程读管道
++    }
++  } else {
++    close(read_fd);
++    exit(0);
++  }
++}
++
++int
++main(void) {
++  int p[2];
++  pipe(p);
++
++  for (int i = 2; i <= 35; ++i) {
++    write(p[1], &i, sizeof(int));
++  }
++  close(p[1]);
++  primes(p[0]);
++  close(p[0]);
++  exit(0);
++}
++
+diff --git a/user/sleep.c b/user/sleep.c
+new file mode 100644
+index 0000000..3480ff7
+--- /dev/null
++++ b/user/sleep.c
+@@ -0,0 +1,21 @@
++//xv6-kabs-2020 Labs Utility
++//sleep
++#include "kernel/types.h"
++#include "kernel/stat.h"
++#include "user/user.h"
++
++int
++main(int argc, char const *argv[])
++{
++  //检查参数数量，小于2则报错，多于2则忽略后面的
++  if (argc < 2) {
++    fprintf(2, "Usage: sleep <ticks>\n");
++    exit(1);
++  }
++
++  //如果参数小于零则不做任何操作
++  int ticks = atoi(argv[1]);
++  sleep(ticks);
++
++  exit(0);
++}
+diff --git a/user/xargs.c b/user/xargs.c
+new file mode 100644
+index 0000000..14fbdb8
+--- /dev/null
++++ b/user/xargs.c
+@@ -0,0 +1,118 @@
++//xv6=labs-2020 Labs Utilities
++//xargs
++//(eXtended ARGuments)用于组合多个命令(将管道或标准输入转换为命令行参数/捕获输出等功能)
++//允许向一个命令中传输多个参数,以xargstest.sh运行为例,使用find找到的./a/b  ./c/b  ./b(换行符隔开)分行传给grep(每次只接受一个参数,共运行三次)(read时会将上述内容全部读入而不是逐行读入)
++//read不会因为读到换行符停止,而是读到文件末尾或指定长度
++#include "kernel/types.h"
++#include "kernel/param.h"
++#include "user/user.h"
++
++#define BUFSIZ 1024 //最大缓存
++
++int
++main(int argc, char *argv[]) {
++  char buf[BUFSIZ]; //用于存放读入数据的缓存(包括换行符,可能是多行)
++  char *cmd[MAXARG];//MAXARG为定义在kernel/param.h中的常量,表示一个进程的最大命令行参数数量(值为32)
++  int cmd_idx = 0; //除去xargs和指令名称以外的参数数量
++  if (argc < 2) {
++    fprintf(2, "Usage: xargs <command>\n");
++    exit(1);
++  }
++  
++  for (int i = 1; i < argc; ++i) { //从第二个参数开始读取(argv[0]是xargs,忽略;argv[1]是要运行的指令名称)
++    cmd[cmd_idx++] = argv[i];
++  }
++  
++  int n = 0;//读入长度
++  while((n = read(0, buf, BUFSIZ)) > 0){//未结束读入则循环
++    char *p = buf; //指向每次'/n'后一字符位置的指针(初始指向buf开头)
++    for(int i = 0; i < n; ++i){
++      if(buf[i] == '\n'){//对本次读入逐字搜索,若找到换行符,则运行指令
++        buf[i] = '\0';
++        cmd[cmd_idx] = p;
++        p = buf + i + 1;
++        
++        int pid = fork();
++         if (pid < 0) {
++          fprintf(2, "Error in xargs: Failed to fork\n");
++          exit(1);
++        } else if (pid == 0) {
++          // 子进程中执行命令
++          exec(argv[1], cmd);
++          fprintf(2, "Error in xargs: Failed to exec\n");
++          exit(1);
++        } else {
++          // 父进程中等待子进程结束
++          wait(0);
++        }
++      }
++    }
++  }
++  
++  exit(0);
++}
++// Lab Xv6 and Unix utilities
++// xargs.c
++
++/*#include "kernel/types.h"
++#include "kernel/stat.h"
++#include "user/user.h"
++#include "kernel/param.h"
++
++#define MAXN 1024
++
++int
++main(int argc, char *argv[])
++{
++    // 如果参数个数小于 2
++    if (argc < 2) {
++        // 打印参数错误提示
++        fprintf(2, "usage: xargs command\n");
++        // 异常退出
++        exit(1);
++    }
++    // 存放子进程 exec 的参数
++    char * argvs[MAXARG];
++    // 索引
++    int index = 0;
++    // 略去 xargs ，用来保存命令行参数
++    for (int i = 1; i < argc; ++i) {
++        argvs[index++] = argv[i];
++    }
++    // 缓冲区存放从管道读出的数据
++    char buf[MAXN] = {"\0"};
++    
++    int n;
++	// 0 代表的是管道的 0，也就是从管道循环读取数据
++    while((n = read(0, buf, MAXN)) > 0 ) {
++        printf("%s\n",buf);
++        // 临时缓冲区存放追加的参数
++		char temp[MAXN] = {"\0"};
++        // xargs 命令的参数后面再追加参数
++        argvs[index] = temp;
++        // 内循环获取追加的参数并创建子进程执行命令
++        for(int i = 0; i < n; ++i) {
++            // 读取单个输入行，当遇到换行符时，创建子线程
++            if(buf[i] == '\n') {
++                // 创建子线程执行命令
++                if (fork() == 0) {
++                printf("%s 8 ",argv[1]);
++                for(int i = 0; i <= index; ++i) {
++                 printf("%s ",argvs[i]);
++                }
++                printf("\n");
++                    exec(argv[1], argvs);
++                }
++                // 等待子线程执行完毕
++                wait(0);
++            } else {
++                // 否则，读取管道的输出作为输入
++                temp[i] = buf[i];
++            }
++        }
++    }
++    // 正常退出
++    exit(0);
++}*/
++
++
