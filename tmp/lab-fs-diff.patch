@@ -1,0 +1,407 @@
+diff --git a/.vscode/settings.json b/.vscode/settings.json
+new file mode 100644
+index 0000000..5f94f34
+--- /dev/null
++++ b/.vscode/settings.json
+@@ -0,0 +1,5 @@
++{
++    "files.associations": {
++        "types.h": "c"
++    }
++}
+\ No newline at end of file
+diff --git a/Makefile b/Makefile
+index d8509b1..cbd3737 100644
+--- a/Makefile
++++ b/Makefile
+@@ -175,6 +175,7 @@ UPROGS=\
+ 	$U/_grind\
+ 	$U/_wc\
+ 	$U/_zombie\
++	$U/_symlinktest
+ 
+ 
+ 
+diff --git a/kernel/fcntl.h b/kernel/fcntl.h
+index 44861b9..87fe99b 100644
+--- a/kernel/fcntl.h
++++ b/kernel/fcntl.h
+@@ -3,3 +3,4 @@
+ #define O_RDWR    0x002
+ #define O_CREATE  0x200
+ #define O_TRUNC   0x400
++#define O_NOFOLLOW 0x004  //取值需要避免位运算冲突(lab9-2)
+diff --git a/kernel/file.h b/kernel/file.h
+index b076d1d..5af6c8a 100644
+--- a/kernel/file.h
++++ b/kernel/file.h
+@@ -14,6 +14,8 @@ struct file {
+ #define	mkdev(m,n)  ((uint)((m)<<16| (n)))
+ 
+ // in-memory copy of an inode
++
++// 修改了NDIRECT+1->NDIRECT+2
+ struct inode {
+   uint dev;           // Device number
+   uint inum;          // Inode number
+@@ -26,7 +28,7 @@ struct inode {
+   short minor;
+   short nlink;
+   uint size;
+-  uint addrs[NDIRECT+1];
++  uint addrs[NDIRECT+2];//lab9-1
+ };
+ 
+ // map major device number to device functions.
+diff --git a/kernel/fs.c b/kernel/fs.c
+index f33553a..0a6c78e 100644
+--- a/kernel/fs.c
++++ b/kernel/fs.c
+@@ -374,24 +374,27 @@ iunlockput(struct inode *ip)
+ 
+ // Return the disk block address of the nth block in inode ip.
+ // If there is no such block, bmap allocates one.
++
++//根据逻辑块号所处区间不同决定哪种块及读取方式
++//下级块通过balloc分配时,需要用log_write更新上级磁盘块
+ static uint
+ bmap(struct inode *ip, uint bn)
+ {
+   uint addr, *a;
+   struct buf *bp;
+ 
+-  if(bn < NDIRECT){
++  if(bn < NDIRECT){//逻辑块号为直接块(0~10)
+     if((addr = ip->addrs[bn]) == 0)
+       ip->addrs[bn] = addr = balloc(ip->dev);
+     return addr;
+   }
+-  bn -= NDIRECT;
++  bn -= NDIRECT;//转换为相对于单间接块的块号(11~267->0~255)
+ 
+-  if(bn < NINDIRECT){
++  if(bn < NINDIRECT){//逻辑块号为单间接块
+     // Load indirect block, allocating if necessary.
+-    if((addr = ip->addrs[NDIRECT]) == 0)
++    if((addr = ip->addrs[NDIRECT]) == 0)//获取单间接块对应磁盘地址,若未分配则分配
+       ip->addrs[NDIRECT] = addr = balloc(ip->dev);
+-    bp = bread(ip->dev, addr);
++    bp = bread(ip->dev, addr);//bread定义bio.c中,返回buf结构体
+     a = (uint*)bp->data;
+     if((addr = a[bn]) == 0){
+       a[bn] = addr = balloc(ip->dev);
+@@ -400,18 +403,46 @@ bmap(struct inode *ip, uint bn)
+     brelse(bp);
+     return addr;
+   }
++  //新增部分
++  bn -= NINDIRECT;//转换为相对于双间接块的块号(268~65803->0~65535(上面减过NDIRECT了))
+ 
++  if(bn < NDINDIRECT){//逻辑块号为双间接块
++    if((addr = ip->addrs[NDIRECT + 1]) == 0)//获取双间接块地址
++      ip->addrs[NDIRECT + 1] = addr = balloc(ip->dev);
++    bp = bread(ip->dev, addr);
++    a = (uint*)bp->data;
++    
++    if((addr = a[bn / NINDIRECT]) == 0) {//获取单间接块地址
++      a[bn / NINDIRECT] = addr = balloc(ip->dev);
++      log_write(bp);
++    }
++    brelse(bp);
++    bp = bread(ip->dev, addr);
++    a = (uint*)bp->data;
++    
++    bn %= NINDIRECT;
++    
++    if((addr = a[bn]) == 0) {//获取直接块地址
++      a[bn] = addr = balloc(ip->dev);
++      log_write(bp);
++    }
++    brelse(bp);
++    return addr;
++  }
++  
++  
+   panic("bmap: out of range");
+ }
+ 
++
+ // Truncate inode (discard contents).
+ // Caller must hold ip->lock.
+ void
+ itrunc(struct inode *ip)
+ {
+-  int i, j;
+-  struct buf *bp;
+-  uint *a;
++  int i, j, k;
++  struct buf *bp, *bp2;
++  uint *a, *a2;
+ 
+   for(i = 0; i < NDIRECT; i++){
+     if(ip->addrs[i]){
+@@ -431,7 +462,30 @@ itrunc(struct inode *ip)
+     bfree(ip->dev, ip->addrs[NDIRECT]);
+     ip->addrs[NDIRECT] = 0;
+   }
+-
++  
++  //新增部分
++  if(ip->addrs[NDIRECT + 1]){
++    bp = bread(ip->dev, ip->addrs[NDIRECT]);
++    a = (uint*)bp->data;
++    for(j = 0; j < NINDIRECT; j++){//遍历双间接块中的所有非空单间接块
++      if(a[j]){//进入该步后,删除方式同上方单间接块部分
++        bp2 = bread(ip->dev, ip->addrs[NDIRECT]);
++        a2 = (uint*)bp->data;
++        for(k = 0; k < NINDIRECT; k++){
++          if(a[k])
++            bfree(ip->dev, a2[k]);
++        }
++        brelse(bp2);
++        bfree(ip->dev, a[j]);
++        a[j] = 0;
++      }
++    }
++    brelse(bp);
++    bfree(ip->dev, ip->addrs[NDIRECT + 1]);
++    ip->addrs[NDIRECT + 1] = 0;
++  }
++  
++  
+   ip->size = 0;
+   iupdate(ip);
+ }
+diff --git a/kernel/fs.h b/kernel/fs.h
+index 139dcc9..ab3c542 100644
+--- a/kernel/fs.h
++++ b/kernel/fs.h
+@@ -24,18 +24,22 @@ struct superblock {
+ 
+ #define FSMAGIC 0x10203040
+ 
+-#define NDIRECT 12
+-#define NINDIRECT (BSIZE / sizeof(uint))
+-#define MAXFILE (NDIRECT + NINDIRECT)
++//#define NDIRECT 12
++#define NDIRECT 11  //减少一个直接块,增加一个双间接块(lab9-1)
++#define NINDIRECT (BSIZE / sizeof(uint))  //单间接块存储指针数量 256
++#define NDINDIRECT (NINDIRECT * NINDIRECT)  //双间接块存储指针数量  256*256(lab9-1)
++#define MAXFILE (NDIRECT + NINDIRECT + NDINDIRECT)  //最大文件上限(lab9-1)
+ 
+ // On-disk inode structure
++
++//NDIRECT+1->NDIRECT+2(lab9-1)
+ struct dinode {
+-  short type;           // File type
+-  short major;          // Major device number (T_DEVICE only)
+-  short minor;          // Minor device number (T_DEVICE only)
+-  short nlink;          // Number of links to inode in file system
+-  uint size;            // Size of file (bytes)
+-  uint addrs[NDIRECT+1];   // Data block addresses
++  short type;           // 文件类型 (T_FILE, T_DIR, T_DEV)
++  short major;          // 设备类型的 major 设备号
++  short minor;          // 设备类型的 minor 设备号
++  short nlink;          // 链接计数器
++  uint size;            // 文件大小（字节数）
++  uint addrs[NDIRECT+2]; // 直接块和间接块的块号
+ };
+ 
+ // Inodes per block.
+@@ -53,6 +57,9 @@ struct dinode {
+ // Directory is a file containing a sequence of dirent structures.
+ #define DIRSIZ 14
+ 
++// 打开符号链接时最大递归深度
++#define MAX_SYMLINK_DEPTH 10 //lab9-2
++
+ struct dirent {
+   ushort inum;
+   char name[DIRSIZ];
+diff --git a/kernel/proc.h b/kernel/proc.h
+index 9c16ea7..7cb9502 100644
+--- a/kernel/proc.h
++++ b/kernel/proc.h
+@@ -104,3 +104,5 @@ struct proc {
+   struct inode *cwd;           // Current directory
+   char name[16];               // Process name (debugging)
+ };
++
++
+diff --git a/kernel/stat.h b/kernel/stat.h
+index 19543af..188726d 100644
+--- a/kernel/stat.h
++++ b/kernel/stat.h
+@@ -1,6 +1,7 @@
+ #define T_DIR     1   // Directory
+ #define T_FILE    2   // File
+ #define T_DEVICE  3   // Device
++#define T_SYMLINK 4   // Symbolic Links
+ 
+ struct stat {
+   int dev;     // File system's disk device
+diff --git a/kernel/syscall.c b/kernel/syscall.c
+index c1b3670..5113b98 100644
+--- a/kernel/syscall.c
++++ b/kernel/syscall.c
+@@ -104,6 +104,7 @@ extern uint64 sys_unlink(void);
+ extern uint64 sys_wait(void);
+ extern uint64 sys_write(void);
+ extern uint64 sys_uptime(void);
++extern uint64 sys_symlink(void); //lab9-2
+ 
+ static uint64 (*syscalls[])(void) = {
+ [SYS_fork]    sys_fork,
+@@ -127,6 +128,7 @@ static uint64 (*syscalls[])(void) = {
+ [SYS_link]    sys_link,
+ [SYS_mkdir]   sys_mkdir,
+ [SYS_close]   sys_close,
++[SYS_symlink] sys_symlink,  //lab9-2
+ };
+ 
+ void
+diff --git a/kernel/syscall.h b/kernel/syscall.h
+index bc5f356..d94a4eb 100644
+--- a/kernel/syscall.h
++++ b/kernel/syscall.h
+@@ -20,3 +20,4 @@
+ #define SYS_link   19
+ #define SYS_mkdir  20
+ #define SYS_close  21
++#define SYS_symlink 22 //lab9-2
+diff --git a/kernel/sysfile.c b/kernel/sysfile.c
+index 5dc453b..dd2249e 100644
+--- a/kernel/sysfile.c
++++ b/kernel/sysfile.c
+@@ -291,25 +291,47 @@ sys_open(void)
+   struct file *f;
+   struct inode *ip;
+   int n;
++  int symlinkDepth = 0;
+ 
+   if((n = argstr(0, path, MAXPATH)) < 0 || argint(1, &omode) < 0)
+     return -1;
+ 
+   begin_op();
+ 
+-  if(omode & O_CREATE){
++  if(omode & O_CREATE){// 创建新文件
+     ip = create(path, T_FILE, 0, 0);
+     if(ip == 0){
+       end_op();
+       return -1;
+     }
+-  } else {
++  } else {// 打开已有文件
+     if((ip = namei(path)) == 0){
+       end_op();
+       return -1;
+     }
+     ilock(ip);
+-    if(ip->type == T_DIR && omode != O_RDONLY){
++    
++  while(ip->type == T_SYMLINK && !(omode & O_NOFOLLOW)){
++    if (symlinkDepth++ > MAX_SYMLINK_DEPTH) {// 记录深度避免死循环
++      iunlockput(ip);
++      end_op();
++      return -1;
++    }
++    if (!readi(ip, 0, (uint64)path, 0, MAXPATH)) {
++      iunlockput(ip);
++      end_op();
++      return -1;
++    }
++    iunlockput(ip);
++    if((ip = namei(path)) == 0){ // target path 不存在
++      end_op();
++      return -1;
++    }
++    ilock(ip);
++  }
++    
++    
++  if(ip->type == T_DIR && omode != O_RDONLY){
+       iunlockput(ip);
+       end_op();
+       return -1;
+@@ -390,8 +412,9 @@ sys_mknod(void)
+ uint64
+ sys_chdir(void)
+ {
+-  char path[MAXPATH];
+   struct inode *ip;
++  char path[MAXPATH];
++  
+   struct proc *p = myproc();
+   
+   begin_op();
+@@ -484,3 +507,41 @@ sys_pipe(void)
+   }
+   return 0;
+ }
++
++// lab9-2
++// xv6系统调用常见方式不是定义传入参数而是使用argstr从寄存器中获取字符串参数
++uint64
++sys_symlink(void) {
++  struct inode *ip;
++  char target[MAXPATH], path[MAXPATH];
++  int n;
++
++  if((n = argstr(0, target, MAXPATH)) < 0)
++    return -1;
++  if (argstr(1, path, MAXPATH) < 0)
++    return -1;
++  // 参数获取失败
++
++  if((ip = namei(path)) != 0)
++    return -1;
++  // 要创建的链接已存在
++
++  begin_op();
++  if((ip = create(path, T_SYMLINK, 0, 0)) == 0) {// 分配并返回inode指针
++    end_op();
++    return -1;
++  }// 创建失败
++  
++  // 将目标路径写入inode的数据内
++  // 注意writei的参数
++  if(writei(ip, 0, (uint64)target, 0, n) != n) {// target已经在内存中,而不是通过缓冲区传递
++    iunlockput(ip);//解锁inode并释放对其的引用
++    end_op();
++    return -1;
++  }
++
++  iunlockput(ip);
++  end_op();
++  return 0;
++}
++
+diff --git a/time.txt b/time.txt
+new file mode 100644
+index 0000000..45a4fb7
+--- /dev/null
++++ b/time.txt
+@@ -0,0 +1 @@
++8
+diff --git a/user/user.h b/user/user.h
+index b71ecda..0e9d58b 100644
+--- a/user/user.h
++++ b/user/user.h
+@@ -23,6 +23,7 @@ int getpid(void);
+ char* sbrk(int);
+ int sleep(int);
+ int uptime(void);
++int symlink(char *target, char *path);  //lab9-2
+ 
+ // ulib.c
+ int stat(const char*, struct stat*);
+diff --git a/user/usys.pl b/user/usys.pl
+index 01e426e..c301bbe 100755
+--- a/user/usys.pl
++++ b/user/usys.pl
+@@ -36,3 +36,4 @@ entry("getpid");
+ entry("sbrk");
+ entry("sleep");
+ entry("uptime");
++entry("symlink");  # lab9-1
