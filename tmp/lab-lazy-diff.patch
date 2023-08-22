@@ -1,0 +1,146 @@
+diff --git a/kernel/sysproc.c b/kernel/sysproc.c
+index e8bcda9..6a8e095 100644
+--- a/kernel/sysproc.c
++++ b/kernel/sysproc.c
+@@ -47,8 +47,20 @@ sys_sbrk(void)
+   if(argint(0, &n) < 0)
+     return -1;
+   addr = myproc()->sz;
+-  if(growproc(n) < 0)
+-    return -1;
++  
++  // 如果要扩展的堆大小超出了可寻址的最大虚拟地址范围，或者小于等于 0，直接返回当前堆大小
++  if (addr + n >= MAXVA || addr + n <= 0)
++    return addr;
++    
++  myproc()->sz += n;  // 虚假地增加size而不物理分配,真正使用该地址时触发缺页中断进行实际页分配
++  
++  // 如果n大于0,则不做操作
++  // 如果n小于0,则需要释放堆内存
++  if(n < 0)
++    uvmdealloc(myproc()->pagetable, addr, myproc()->sz);
++  
++  //if(growproc(n) < 0) //不实际物理分配
++  //  return -1;
+   return addr;
+ }
+ 
+diff --git a/kernel/trap.c b/kernel/trap.c
+index a63249e..cfde22a 100644
+--- a/kernel/trap.c
++++ b/kernel/trap.c
+@@ -65,6 +65,24 @@ usertrap(void)
+     intr_on();
+ 
+     syscall();
++  } else if (r_scause() == 13 || r_scause() == 15) {//13/15对应发生读/写缺页中断
++    //printf("page fault trap: signal %d at address %p\n", r_scause(), r_stval()); // 打印中断类型以及引发中断的虚拟地址
++    uint64 va = r_stval(); // 错误的虚拟地址被保存在此处
++    uint64 pa = (uint64) kalloc();	// 物理地址
++    if (pa == 0) {//  分配物理地址失败
++      p->killed = 1;
++    } else if (va >= p->sz || va <= PGROUNDDOWN(p->trapframe->sp)) {
++      kfree((void*)pa);
++      p->killed = 1;
++    } else {
++      va = PGROUNDDOWN(va);
++      memset((void *)pa, 0, PGSIZE); // 将分配的物理页面清零
++      // 将物理页面映射到虚拟地址，并设置页面标志为可写、可执行、可读、用户模式
++      if (mappages(p->pagetable, va, PGSIZE, pa, PTE_W|PTE_R|PTE_U) != 0) {//若分配失败
++        kfree((void *)pa); // 解除分配的物理页面
++        p->killed = 1;	   // 终止进程
++      }
++    }
+   } else if((which_dev = devintr()) != 0){
+     // ok
+   } else {
+diff --git a/kernel/vm.c b/kernel/vm.c
+index bccb405..f194d66 100644
+--- a/kernel/vm.c
++++ b/kernel/vm.c
+@@ -6,6 +6,9 @@
+ #include "defs.h"
+ #include "fs.h"
+ 
++#include "spinlock.h"
++#include "proc.h"
++
+ /*
+  * the kernel's page table.
+  */
+@@ -101,10 +104,31 @@ walkaddr(pagetable_t pagetable, uint64 va)
+     return 0;
+ 
+   pte = walk(pagetable, va, 0);
+-  if(pte == 0)
+-    return 0;
+-  if((*pte & PTE_V) == 0)
+-    return 0;
++  //if(pte == 0)
++  //  return 0;
++  //if((*pte & PTE_V) == 0)
++  //  return 0;
++  
++   // 如果页表项不存在或者虚拟页面没有被映射，执行下面的懒分配操作
++  if (pte == 0 || (*pte & PTE_V) == 0) {
++    struct proc *p = myproc();
++    // 检查虚拟地址是否在进程的有效范围内
++    if(va >= p->sz || va < PGROUNDUP(p->trapframe->sp))
++      return 0;
++
++    // 分配物理内存
++    pa = (uint64)kalloc();
++    if (pa == 0)
++      return 0;
++
++    // 在页表中建立映射
++    if (mappages(p->pagetable, va, PGSIZE, pa, PTE_W|PTE_R|PTE_U|PTE_X) != 0) {
++      kfree((void*)pa);
++      return 0;
++    }
++    return pa; // 返回物理地址
++  }
++  
+   if((*pte & PTE_U) == 0)
+     return 0;
+   pa = PTE2PA(*pte);
+@@ -180,10 +204,12 @@ uvmunmap(pagetable_t pagetable, uint64 va, uint64 npages, int do_free)
+     panic("uvmunmap: not aligned");
+ 
+   for(a = va; a < va + npages*PGSIZE; a += PGSIZE){
+-    if((pte = walk(pagetable, a, 0)) == 0)
+-      panic("uvmunmap: walk");
+-    if((*pte & PTE_V) == 0)
+-      panic("uvmunmap: not mapped");
++    if((pte = walk(pagetable, a, 0)) == 0) // 使用walk获取页表项,若获取失败则说明该虚拟地址尚未映射,跳过
++      continue;
++      //panic("uvmunmap: walk");
++    if((*pte & PTE_V) == 0)		   // PTE_V判断虚拟地址对应的也表象是否已被映射,若没有被映射自然也不需要解除映射
++      continue;
++      //panic("uvmunmap: not mapped");
+     if(PTE_FLAGS(*pte) == PTE_V)
+       panic("uvmunmap: not a leaf");
+     if(do_free){
+@@ -314,10 +340,12 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
+   char *mem;
+ 
+   for(i = 0; i < sz; i += PGSIZE){
+-    if((pte = walk(old, i, 0)) == 0)
+-      panic("uvmcopy: pte should exist");
++    if((pte = walk(old, i, 0)) == 0) //与uvmunmap类似
++      continue;
++      //panic("uvmcopy: pte should exist");
+     if((*pte & PTE_V) == 0)
+-      panic("uvmcopy: page not present");
++      continue;
++      //panic("uvmcopy: page not present");
+     pa = PTE2PA(*pte);
+     flags = PTE_FLAGS(*pte);
+     if((mem = kalloc()) == 0)
+diff --git a/time.txt b/time.txt
+new file mode 100644
+index 0000000..b8626c4
+--- /dev/null
++++ b/time.txt
+@@ -0,0 +1 @@
++4
