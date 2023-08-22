@@ -1,0 +1,228 @@
+diff --git a/answers-thread.txt b/answers-thread.txt
+new file mode 100644
+index 0000000..795a30a
+--- /dev/null
++++ b/answers-thread.txt
+@@ -0,0 +1,5 @@
++没有同步机制时,一个线程的插入操作可能会覆盖另一个线程的插入操作,即insert操作非原子性(put和get也是)
++例如，考虑有两个线程同时将键值对 [4, 'd'] 和 [5, 'e'] 添加到同一个桶中：
++原始桶内容为 [<1, 'a'>, <2, 'b'>, <3, 'c'>]
++在 put() 函数中，它们都会迭代到链表的末尾，并决定在 <3, 'c'> 的后面插入
++无论哪个线程执行了 '*p = e' 这一行，都会导致另一边的改变被覆盖，从而丢失数据。
+diff --git a/notxv6/barrier.c b/notxv6/barrier.c
+index 12793e8..1a5cc82 100644
+--- a/notxv6/barrier.c
++++ b/notxv6/barrier.c
+@@ -8,10 +8,10 @@ static int nthread = 1;
+ static int round = 0;
+ 
+ struct barrier {
+-  pthread_mutex_t barrier_mutex;
+-  pthread_cond_t barrier_cond;
+-  int nthread;      // Number of threads that have reached this round of the barrier
+-  int round;     // Barrier round
++  pthread_mutex_t barrier_mutex;//互斥锁，用于保护对 barrier 结构体中的数据的并发访问。在访问 barrier 结构体中的变量时，需要先获取该锁，以确保多个线程不会同时修改这些变量。
++  pthread_cond_t barrier_cond;//条件变量，用于实现线程在达到屏障点时的等待和唤醒操作。当一个线程达到屏障点时，它会等待在这个条件变量上，直到所有参与的线程都达到了屏障点，然后通过调用pthread_cond_broadcast 唤醒所有等待在该条件变量上的线程。
++  int nthread;      // Number of threads that have reached this round of the barrier //记录达到当前屏障点的线程数量。每个线程达到屏障点时会增加这个计数器，当计数器达到预期值时，表示所有线程都已经到达，可以执行下一轮的屏障操作。
++  int round;     // Barrier round //记录当前屏障的轮数。每次所有线程都到达屏障点后，会增加这个计数器，表示进入了下一轮的屏障操作。
+ } bstate;
+ 
+ static void
+@@ -30,7 +30,15 @@ barrier()
+   // Block until all threads have called barrier() and
+   // then increment bstate.round.
+   //
+-  
++  pthread_mutex_lock(&bstate.barrier_mutex);
++  if(++bstate.nthread == nthread) {//检查当前已经调用barrier()的线程数量是否达到了总线程数nthread。如果是最后一个线程到达，就意味着所有线程都已经到达屏障点。
++    bstate.nthread = 0;					// 如果是最后一个线程到达，则将bstate.nthread重置为0
++    bstate.round++;					// 将bstate.round（表示轮数）递增
++    pthread_cond_broadcast(&bstate.barrier_cond);	// 并使用pthread_cond_broadcast函数广播信号给所有等待在bstate.barrier_cond条件变量上的线程，以唤醒它们。
++  } else {
++    pthread_cond_wait(&bstate.barrier_cond, &bstate.barrier_mutex); // 如果不是最后一个线程到达，则当前线程通过pthread_cond_wait函数在bstate.barrier_cond条件变量上等待，同时释放之前获取的互斥锁。这将使得线程暂停执行，直到被唤醒。
++  }
++  pthread_mutex_unlock(&bstate.barrier_mutex);
+ }
+ 
+ static void *
+diff --git a/notxv6/ph.c b/notxv6/ph.c
+index 6df1500..651a214 100644
+--- a/notxv6/ph.c
++++ b/notxv6/ph.c
+@@ -8,6 +8,8 @@
+ #define NBUCKET 5
+ #define NKEYS 100000
+ 
++pthread_mutex_t locks[NBUCKET]; // 每个桶对应一个锁
++
+ struct entry {
+   int key;
+   int value;
+@@ -40,12 +42,14 @@ void put(int key, int value)
+ {
+   int i = key % NBUCKET;
+ 
++  //pthread_mutex_lock(&locks[i]);
+   // is the key already present?
+   struct entry *e = 0;
+   for (e = table[i]; e != 0; e = e->next) {
+     if (e->key == key)
+       break;
+   }
++  pthread_mutex_lock(&locks[i]);
+   if(e){
+     // update the existing key.
+     e->value = value;
+@@ -53,6 +57,7 @@ void put(int key, int value)
+     // the new is new.
+     insert(key, value, &table[i], table[i]);
+   }
++  pthread_mutex_unlock(&locks[i]);
+ }
+ 
+ static struct entry*
+@@ -60,12 +65,15 @@ get(int key)
+ {
+   int i = key % NBUCKET;
+ 
++  //pthread_mutex_lock(&locks[i]);
+ 
+   struct entry *e = 0;
+   for (e = table[i]; e != 0; e = e->next) {
+     if (e->key == key) break;
+   }
+ 
++  //pthread_mutex_unlock(&locks[i]);
++
+   return e;
+ }
+ 
+@@ -107,6 +115,11 @@ main(int argc, char *argv[])
+     fprintf(stderr, "Usage: %s nthreads\n", argv[0]);
+     exit(-1);
+   }
++  
++  //在main函数开头初始化锁
++  for(int i = 0; i < NBUCKET; ++i)
++    pthread_mutex_init(&locks[i], NULL);
++  
+   nthread = atoi(argv[1]);
+   tha = malloc(sizeof(pthread_t) * nthread);
+   srandom(0);
+diff --git a/time.txt b/time.txt
+new file mode 100644
+index 0000000..b8626c4
+--- /dev/null
++++ b/time.txt
+@@ -0,0 +1 @@
++4
+diff --git a/user/uthread.c b/user/uthread.c
+index 8e46826..bf2a4c0 100644
+--- a/user/uthread.c
++++ b/user/uthread.c
+@@ -10,10 +10,31 @@
+ #define STACK_SIZE  8192
+ #define MAX_THREAD  4
+ 
++//从proc.h中复制的结构体内容,用于保存进程/线程上下文内容
++struct context {
++  uint64 ra;//Return Address Register:返回地址寄存器,存储函数调用返回的地址，即函数调用结束后的下一条指令的地址。
++  uint64 sp;//Stack Pointer Register:栈指针寄存器,指向当前线程的栈顶。
++
++  // 通用寄存器
++  uint64 s0;
++  uint64 s1;
++  uint64 s2;
++  uint64 s3;
++  uint64 s4;
++  uint64 s5;
++  uint64 s6;
++  uint64 s7;
++  uint64 s8;
++  uint64 s9;
++  uint64 s10;
++  uint64 s11;
++};
++
+ 
+ struct thread {
+   char       stack[STACK_SIZE]; /* the thread's stack */
+   int        state;             /* FREE, RUNNING, RUNNABLE */
++  struct context context;       //保存上下文用
+ 
+ };
+ struct thread all_thread[MAX_THREAD];
+@@ -28,6 +49,10 @@ thread_init(void)
+   // save thread 0's state.  thread_schedule() won't run the main thread ever
+   // again, because its state is set to RUNNING, and thread_schedule() selects
+   // a RUNNABLE thread.
++  
++  // main() 是线程 0，它将首次调用 thread_schedule()。它需要一个堆栈，以便第一个 thread_switch() 可以保存线程 0 的状态。
++  // thread_schedule() 不会再次运行主线程，因为它的状态被设置为 RUNNING，并且 thread_schedule() 选择一个 RUNNABLE 线程。
++
+   current_thread = &all_thread[0];
+   current_thread->state = RUNNING;
+ }
+@@ -63,6 +88,9 @@ thread_schedule(void)
+      * Invoke thread_switch to switch from t to next_thread:
+      * thread_switch(??, ??);
+      */
++    //参考kernel/proc.c/scheduler中的swtch(&c->context, &p->context);语句
++    thread_switch((uint64)&t->context, (uint64)&current_thread->context);
++    
+   } else
+     next_thread = 0;
+ }
+@@ -77,6 +105,8 @@ thread_create(void (*func)())
+   }
+   t->state = RUNNABLE;
+   // YOUR CODE HERE
++  t->context.ra = (uint64) func;  // 初始调用地址为用户传进来的线程函数的地址
++  t->context.sp = (uint64) ((char *)&t->stack + STACK_SIZE);  // 初始sp在栈顶,故需要加上STACK_SIZE
+ }
+ 
+ void 
+diff --git a/user/uthread_switch.S b/user/uthread_switch.S
+index 5defb12..e428c9e 100644
+--- a/user/uthread_switch.S
++++ b/user/uthread_switch.S
+@@ -8,4 +8,38 @@
+ 	.globl thread_switch
+ thread_switch:
+ 	/* YOUR CODE HERE */
+-	ret    /* return to ra */
++	//复制kernel/swtch.S内容,用于切换线程执行的上下文
++	//ra:Return Address Register:返回地址寄存器,存储函数调用返回的地址，即函数调用结束后的下一条指令的地址。
++  	//sp:Stack Pointer Register:栈指针寄存器,指向当前线程的栈顶。
++	//在汇编层面实现了保存当前线程的寄存器状态到一个结构体（old），然后从另一个结构体（new）中加载寄存器状态以切换到另一个线程的执行。sd:存储双字/ld:加载双字,用于存储和加载寄存器的值,可以在切换线程时保存当前线程上下文并回复新线程上下文,实现线程的无缝切换
++        sd ra, 0(a0)
++        sd sp, 8(a0)
++        sd s0, 16(a0)
++        sd s1, 24(a0)
++        sd s2, 32(a0)
++        sd s3, 40(a0)
++        sd s4, 48(a0)
++        sd s5, 56(a0)
++        sd s6, 64(a0)
++        sd s7, 72(a0)
++        sd s8, 80(a0)
++        sd s9, 88(a0)
++        sd s10, 96(a0)
++        sd s11, 104(a0)
++
++        ld ra, 0(a1)
++        ld sp, 8(a1)
++        ld s0, 16(a1)
++        ld s1, 24(a1)
++        ld s2, 32(a1)
++        ld s3, 40(a1)
++        ld s4, 48(a1)
++        ld s5, 56(a1)
++        ld s6, 64(a1)
++        ld s7, 72(a1)
++        ld s8, 80(a1)
++        ld s9, 88(a1)
++        ld s10, 96(a1)
++        ld s11, 104(a1)
++        
++        ret
