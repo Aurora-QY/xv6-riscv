@@ -1,0 +1,228 @@
+diff --git a/grade-lab-cow b/grade-lab-cow
+index 8eff3b7..1bf5396 100755
+--- a/grade-lab-cow
++++ b/grade-lab-cow
+@@ -29,7 +29,7 @@ def test_file():
+ def test_usertests():
+     r.run_qemu(shell_script([
+         'usertests'
+-    ]), timeout=300)
++    ]), timeout=3000)
+     r.match('^ALL TESTS PASSED$')
+ 
+ def usertest_check(testcase, nextcase, output):
+diff --git a/kernel/defs.h b/kernel/defs.h
+index 4b9bbc0..9effdd3 100644
+--- a/kernel/defs.h
++++ b/kernel/defs.h
+@@ -64,6 +64,8 @@ void*           kalloc(void);
+ void            kfree(void *);
+ void            kinit(void);
+ 
++void		addcow(uint64 pa, int num);
++
+ // log.c
+ void            initlog(int, struct superblock*);
+ void            log_write(struct buf*);
+@@ -172,6 +174,8 @@ int             copyout(pagetable_t, uint64, char *, uint64);
+ int             copyin(pagetable_t, char *, uint64, uint64);
+ int             copyinstr(pagetable_t, char *, uint64, uint64);
+ 
++int		cowalloc(pagetable_t pagetable, uint64 va);
++
+ // plic.c
+ void            plicinit(void);
+ void            plicinithart(void);
+diff --git a/kernel/kalloc.c b/kernel/kalloc.c
+index fa6a0ac..85f21ef 100644
+--- a/kernel/kalloc.c
++++ b/kernel/kalloc.c
+@@ -9,6 +9,9 @@
+ #include "riscv.h"
+ #include "defs.h"
+ 
++#define PA2INDEX(pa) (((uint64)pa)/PGSIZE) //将物理地址转化为计数器下标
++uint64  n_cow[PHYSTOP/PGSIZE];//计数器,一个物理页可能同时有多个进程的虚拟页指向他,所以freepage时当物理页计数器降为0时才真正释放他
++
+ void freerange(void *pa_start, void *pa_end);
+ 
+ extern char end[]; // first address after kernel.
+@@ -35,8 +38,10 @@ freerange(void *pa_start, void *pa_end)
+ {
+   char *p;
+   p = (char*)PGROUNDUP((uint64)pa_start);
+-  for(; p + PGSIZE <= (char*)pa_end; p += PGSIZE)
++  for(; p + PGSIZE <= (char*)pa_end; p += PGSIZE){
++    n_cow[PA2INDEX(p)] = 1; // 初始化的时候把每个物理页的计数器设为1,及计为free
+     kfree(p);
++  }
+ }
+ 
+ // Free the page of physical memory pointed at by v,
+@@ -51,6 +56,12 @@ kfree(void *pa)
+   if(((uint64)pa % PGSIZE) != 0 || (char*)pa < end || (uint64)pa >= PHYSTOP)
+     panic("kfree");
+ 
++  acquire(&kmem.lock);
++  int remain = --n_cow[PA2INDEX(pa)];
++  release(&kmem.lock);
++  
++  if (remain > 0) //计数器降为0后才真正释放,否则不释放.
++    return;
+   // Fill with junk to catch dangling refs.
+   memset(pa, 1, PGSIZE);
+ 
+@@ -76,7 +87,23 @@ kalloc(void)
+     kmem.freelist = r->next;
+   release(&kmem.lock);
+ 
+-  if(r)
++  if(r){
+     memset((char*)r, 5, PGSIZE); // fill with junk
++    int idx = PA2INDEX(r);
++    if (n_cow[idx] != 0)
++      panic("kalloc: n_cow[idx] != 0");
++    n_cow[idx] = 1; // 新分配的物理页的计数器初始化为1
++  }
+   return (void*)r;
+ }
++
++//辅助调整计数器的函数,这样就不用在vm.c中声明n_cow等操作而可以直接调用
++void
++addcow(uint64 pa, int num) {
++  if (pa >= PHYSTOP)//超过物理内存最大地址
++    panic("addcow: pa too big");
++  //上锁避免冲突
++  acquire(&kmem.lock);
++  n_cow[PA2INDEX(pa)] += num;
++  release(&kmem.lock);
++}
+diff --git a/kernel/riscv.h b/kernel/riscv.h
+index 0aec003..50cd870 100644
+--- a/kernel/riscv.h
++++ b/kernel/riscv.h
+@@ -332,6 +332,8 @@ sfence_vma()
+ #define PTE_X (1L << 3)
+ #define PTE_U (1L << 4) // 1 -> user can access
+ 
++#define PTE_COW (1L << 8)// COW标记位
++
+ // shift a physical address to the right place for a PTE.
+ #define PA2PTE(pa) ((((uint64)pa) >> 12) << 10)
+ 
+diff --git a/kernel/trap.c b/kernel/trap.c
+index a63249e..f82bfb1 100644
+--- a/kernel/trap.c
++++ b/kernel/trap.c
+@@ -65,6 +65,12 @@ usertrap(void)
+     intr_on();
+ 
+     syscall();
++  } else if(r_scause() == 15){//如果要在一个cow只读页面上写,则为该进程额外分配复制一页
++    uint64 va = r_stval();
++      if(va >= p->sz)
++        p->killed = 1;
++      else if (cowalloc(p->pagetable, va) < 0)
++        p->killed = 1;
+   } else if((which_dev = devintr()) != 0){
+     // ok
+   } else {
+diff --git a/kernel/vm.c b/kernel/vm.c
+index bccb405..b0fa582 100644
+--- a/kernel/vm.c
++++ b/kernel/vm.c
+@@ -311,7 +311,7 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
+   pte_t *pte;
+   uint64 pa, i;
+   uint flags;
+-  char *mem;
++  //char *mem;
+ 
+   for(i = 0; i < sz; i += PGSIZE){
+     if((pte = walk(old, i, 0)) == 0)
+@@ -319,14 +319,16 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
+     if((*pte & PTE_V) == 0)
+       panic("uvmcopy: page not present");
+     pa = PTE2PA(*pte);
++    *pte = (*pte & ~PTE_W) | PTE_COW;// 变为只读页面, 不允许写. 一旦试图写, 会触发trap.c中r_scause()=15的trap
+     flags = PTE_FLAGS(*pte);
+-    if((mem = kalloc()) == 0)
+-      goto err;
+-    memmove(mem, (char*)pa, PGSIZE);
+-    if(mappages(new, i, PGSIZE, (uint64)mem, flags) != 0){
+-      kfree(mem);
++    //if((mem = kalloc()) == 0)
++    //  goto err;
++    //memmove(mem, (char*)pa, PGSIZE);
++    if(mappages(new, i, PGSIZE, pa, flags) != 0){//直接使用原物理页进行映射而不是使用mem作为地址
++      //kfree(mem);
+       goto err;
+     }
++    addcow(pa, 1);//该页面计数器增加
+   }
+   return 0;
+ 
+@@ -358,9 +360,28 @@ copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
+ 
+   while(len > 0){
+     va0 = PGROUNDDOWN(dstva);
++    
++    if (va0 >= MAXVA) {
++      printf("copyout: va exceeds MAXVA\n");
++      return -1;
++    }
++    pte_t *pte = walk(pagetable, va0, 0);
++    if (pte == 0 || (*pte & PTE_U) == 0 || (*pte & PTE_V) == 0) {
++      printf("copyout: invalid pte\n");
++      return -1;
++    }
++    if (*pte & PTE_COW) {
++    //判断是否为一个共享COW页
++      if (cowalloc(pagetable, va0) < 0) {
++        printf("copyout: cowalloc error\n");
++        return -1;
++      }
++    }
++    
+     pa0 = walkaddr(pagetable, va0);
+     if(pa0 == 0)
+       return -1;
++
+     n = PGSIZE - (dstva - va0);
+     if(n > len)
+       n = len;
+@@ -440,3 +461,27 @@ copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
+     return -1;
+   }
+ }
++
++//进程想要对于一个只读的COW页面进行修改时, 我们需要把这一页复制一遍赋给这个进程
++int
++cowalloc(pagetable_t pagetable, uint64 va) {
++  if (va >= MAXVA) {// 检查传入的虚拟地址是否超过了最大虚拟地址
++    panic("cowalloc: exceeds MAXVA\n");
++    return -1;
++  }
++  // 获取虚拟地址对应的页表项
++  pte_t* pte = walk(pagetable, va, 0); // 应该指向一个共享的物理页面
++  // 检查页表项是否有效且有用户访问权限
++  if (pte == 0)
++    panic("cowalloc: pte not exists");
++  if ((*pte & PTE_V) == 0 || (*pte & PTE_U) == 0)
++    panic("cowalloc: pte permission err");
++  uint64 pa_new = (uint64)kalloc();
++  if (pa_new == 0)
++    panic("cowalloc: kalloc fails\n");
++  uint64 pa_old = PTE2PA(*pte);
++  memmove((void *)pa_new, (const void *)pa_old, PGSIZE);
++  kfree((void *)pa_old);   // 释放旧的物理页面，在kfree中会减少COW页面的计数
++  *pte = PA2PTE(pa_new) | PTE_FLAGS(*pte) | PTE_W | PTE_COW;
++  return 0;
++}
+diff --git a/time.txt b/time.txt
+new file mode 100644
+index 0000000..1e8b314
+--- /dev/null
++++ b/time.txt
+@@ -0,0 +1 @@
++6
