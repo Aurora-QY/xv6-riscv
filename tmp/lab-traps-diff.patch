@@ -1,0 +1,298 @@
+diff --git a/Makefile b/Makefile
+index 1fa367e..a74296b 100644
+--- a/Makefile
++++ b/Makefile
+@@ -175,6 +175,7 @@ UPROGS=\
+ 	$U/_grind\
+ 	$U/_wc\
+ 	$U/_zombie\
++	$U/_alarmtest\
+ 
+ 
+ 
+diff --git a/answers-traps.txt b/answers-traps.txt
+new file mode 100644
+index 0000000..23b122a
+--- /dev/null
++++ b/answers-traps.txt
+@@ -0,0 +1,32 @@
++1)	哪些寄存器包含函数的参数？例如，在 main 调用 printf 时，哪个寄存器保存了 13？
++答：a0,a1,a2包含了参数的参数。a2保存了13。
++根据main中这一条汇编信息可以看出，13被放到了a2寄存器中
++  24:	4635                	li	a2,13
++2)	在 main 的汇编代码中，函数 f 的调用在哪里？函数 g 的调用在哪里？（提示：编译器可能会内联函数。）
++答：函数f在main的汇编代码中没有实际的函数调用，printf("%d %d\n", f(8)+1, 13);中的f(8)实际上不会跳转到f计算并返回，而是直接展开，因为编译器将其内联到了main函数中。
++函数g则先内联到f中，再进一步内联到main中。
++3)	函数 printf 的地址在哪里？
++答：0x0000000000000628
++在call.asm中可见：
++0000000000000628 <printf>:
++
++void
++printf(const char *fmt, ...)
++{
++ 628:	711d                	addi	sp,sp,-96
++......
++4)	在 main 中的 jalr 到 printf 之后，寄存器 ra 中有什么值？
++答：0x38(ra=pc+4)
++jalr指令将pc+4赋给当前寄存器，即下一条指令的地址。
++5)	运行以下代码。
++unsigned int i = 0x00646c72;
++printf("H%x Wo%s", 57616, &i);
++输出是什么？ 如果 RISC-V 是大端序的，要实现同样的效果，需要将 i 设置为什么？需要将 57616 修改为别的值吗？
++答：He110 World 。0x726c6400。不需要
++%s输出字符串的起始地址为i，按照字符的格式读取字符，直到读取到 '\0' 为止。如果按照题目中的i的值，若是大端序表示，则读取顺序为72->6c->64->00；若是小端序表示，则读取顺序为00->64->6c->72。所以若是内存中存放的数是：72 6c 64 00，则小端序表示刚好对应rld+'\0'。
++57616的16进制表示就是e110，与大小端序无关。
++6)	在以下代码中，'y=' 后会打印什么？（注意：答案不是特定的值。）为什么会发生这种情况？
++printf("x=%d y=%d", 3);
++答：a2寄存器中的值（随机）
++printf的format字符串在寄存器a0（不是只有一个3作为参数）, 3在寄存器a1。所以y只能打印a2中留存的值。
++
+diff --git a/kernel/defs.h b/kernel/defs.h
+index 4b9bbc0..fce1c1f 100644
+--- a/kernel/defs.h
++++ b/kernel/defs.h
+@@ -81,6 +81,8 @@ void            printf(char*, ...);
+ void            panic(char*) __attribute__((noreturn));
+ void            printfinit(void);
+ 
++void 		backtrace(void);
++
+ // proc.c
+ int             cpuid(void);
+ void            exit(int);
+diff --git a/kernel/printf.c b/kernel/printf.c
+index e1347de..f86d3ba 100644
+--- a/kernel/printf.c
++++ b/kernel/printf.c
+@@ -25,6 +25,17 @@ static struct {
+ 
+ static char digits[] = "0123456789abcdef";
+ 
++// 实现 backtrace 函数
++void
++backtrace() {
++  // 读取当前函数的栈顶指针 fp，以及页的起始地址
++  uint64 fp = r_fp(), top = PGROUNDUP(fp);
++  printf("backtrace:\n");
++  // 循环打印每个栈帧的返回地址
++  for (; fp < top; fp = *((uint64*)(fp - 16)))
++    printf("%p\n", *((uint64*)(fp - 8)));
++}
++
+ static void
+ printint(int xx, int base, int sign)
+ {
+@@ -121,6 +132,7 @@ panic(char *s)
+   printf("panic: ");
+   printf(s);
+   printf("\n");
++  backtrace(); // 调用回溯
+   panicked = 1; // freeze uart output from other CPUs
+   for(;;)
+     ;
+diff --git a/kernel/proc.c b/kernel/proc.c
+index dab1e1d..2f6046a 100644
+--- a/kernel/proc.c
++++ b/kernel/proc.c
+@@ -127,6 +127,15 @@ found:
+   p->context.ra = (uint64)forkret;
+   p->context.sp = p->kstack + PGSIZE;
+ 
++  p->interval = 0;
++  p->handler = 0;
++  p->ticks = 0;
++  if((p->pretrapframe = (struct trapframe *)kalloc()) == 0){
++    release(&p->lock);
++    return 0;
++  }
++
++
+   return p;
+ }
+ 
+@@ -150,6 +159,12 @@ freeproc(struct proc *p)
+   p->killed = 0;
+   p->xstate = 0;
+   p->state = UNUSED;
++  
++  p->interval = 0;
++  p->handler = 0;
++  p->ticks = 0;
++  if(p->pretrapframe)
++    kfree((void*)p->pretrapframe);
+ }
+ 
+ // Create a user page table for a given process,
+diff --git a/kernel/proc.h b/kernel/proc.h
+index 9c16ea7..bbaf795 100644
+--- a/kernel/proc.h
++++ b/kernel/proc.h
+@@ -103,4 +103,9 @@ struct proc {
+   struct file *ofile[NOFILE];  // Open files
+   struct inode *cwd;           // Current directory
+   char name[16];               // Process name (debugging)
++  
++  int interval; 	       // 记录时间间隔
++  int ticks;		       // 记录经过的时钟数
++  uint64 handler;	       // 调用函数信息
++  struct trapframe *pretrapframe; // 指向handler执行前的trapframe,以在alarm后恢复调用handler前的状态
+ };
+diff --git a/kernel/riscv.h b/kernel/riscv.h
+index 0aec003..8280c85 100644
+--- a/kernel/riscv.h
++++ b/kernel/riscv.h
+@@ -279,6 +279,14 @@ intr_get()
+   return (x & SSTATUS_SIE) != 0;
+ }
+ 
++// 用于读取 s0 寄存器的值
++static inline uint64
++r_fp() {
++  uint64 x;
++  asm volatile("mv %0, s0" : "=r" (x));
++  return x;
++}
++
+ static inline uint64
+ r_sp()
+ {
+diff --git a/kernel/syscall.c b/kernel/syscall.c
+index c1b3670..eb079af 100644
+--- a/kernel/syscall.c
++++ b/kernel/syscall.c
+@@ -104,6 +104,8 @@ extern uint64 sys_unlink(void);
+ extern uint64 sys_wait(void);
+ extern uint64 sys_write(void);
+ extern uint64 sys_uptime(void);
++extern uint64 sys_sigalarm(void);
++extern uint64 sys_sigreturn(void);
+ 
+ static uint64 (*syscalls[])(void) = {
+ [SYS_fork]    sys_fork,
+@@ -127,6 +129,8 @@ static uint64 (*syscalls[])(void) = {
+ [SYS_link]    sys_link,
+ [SYS_mkdir]   sys_mkdir,
+ [SYS_close]   sys_close,
++[SYS_sigalarm]  sys_sigalarm,
++[SYS_sigreturn] sys_sigreturn,
+ };
+ 
+ void
+diff --git a/kernel/syscall.h b/kernel/syscall.h
+index bc5f356..382d781 100644
+--- a/kernel/syscall.h
++++ b/kernel/syscall.h
+@@ -20,3 +20,5 @@
+ #define SYS_link   19
+ #define SYS_mkdir  20
+ #define SYS_close  21
++#define SYS_sigalarm  22
++#define SYS_sigreturn 23
+diff --git a/kernel/sysproc.c b/kernel/sysproc.c
+index e8bcda9..08a621a 100644
+--- a/kernel/sysproc.c
++++ b/kernel/sysproc.c
+@@ -7,6 +7,37 @@
+ #include "spinlock.h"
+ #include "proc.h"
+ 
++
++//从用户空间获取定时器间隔和用户提供的函数指针，然后将这些信息存储在当前进程的相关字段中。当定时器触发时，内核就知道要调用哪个函数以及何时调用。
++uint64
++sys_sigalarm(void)
++{
++  int interval;            // 定时器间隔
++  uint64 handler;          // 用户提供的函数指针
++  struct proc *p;          // 指向当前进程的指针
++
++  // 从用户空间获取定时器间隔和函数指针
++  if (argint(0, &interval) < 0 || argaddr(1, &handler) < 0 || interval < 0) {
++    return -1;             // 参数错误，返回 -1 表示失败
++  }
++
++  p = myproc();            // 获取当前进程的指针
++  p->interval = interval;  // 设置定时器间隔
++  p->handler = handler;    // 存储用户提供的函数指针
++  p->ticks = 0;            // 重置 ticks 计数器，用于计数定时器的触发次数
++
++  return 0;                // 返回 0 表示成功
++}
++
++uint64
++sys_sigreturn(void)
++{
++  struct proc *p = myproc();
++  *p->trapframe = *p->pretrapframe; //将trapframe还原成中断前的状态
++  p->ticks = 0;
++  return 0;
++}
++
+ uint64
+ sys_exit(void)
+ {
+@@ -70,6 +101,7 @@ sys_sleep(void)
+     sleep(&ticks, &tickslock);
+   }
+   release(&tickslock);
++  backtrace(); // 调用回溯
+   return 0;
+ }
+ 
+diff --git a/kernel/trap.c b/kernel/trap.c
+index a63249e..2afd244 100644
+--- a/kernel/trap.c
++++ b/kernel/trap.c
+@@ -77,8 +77,21 @@ usertrap(void)
+     exit(-1);
+ 
+   // give up the CPU if this is a timer interrupt.
+-  if(which_dev == 2)
+-    yield();
++  //if(which_dev == 2)
++  //  yield();
++  
++  if(which_dev == 2) {            // 检查中断类型是否是定时器中断
++    if(p->interval) {             // 如果进程设置了定时器
++        if(p->ticks == p->interval) {  // 如果定时器触发次数达到设定的间隔
++            //p->ticks = 0;              // 重置定时器触发次数(test0可以重置, test1/2需要实现正确返回调用前状态,不能清空)
++            *p->pretrapframe = *p->trapframe; //存储当前的trapframe(即寄存器信息),用于调用后的恢复
++            p->trapframe->epc = p->handler;  // 将处理函数的地址赋值给 EPC 寄存器
++        }
++        p->ticks++;               // 增加定时器触发次数
++    }
++    yield();                      // 调用 yield()，切换到其他进程执行
++  }
++
+ 
+   usertrapret();
+ }
+diff --git a/time.txt b/time.txt
+new file mode 100644
+index 0000000..1e8b314
+--- /dev/null
++++ b/time.txt
+@@ -0,0 +1 @@
++6
+diff --git a/user/user.h b/user/user.h
+index b71ecda..4b90e42 100644
+--- a/user/user.h
++++ b/user/user.h
+@@ -40,3 +40,6 @@ void free(void*);
+ int atoi(const char*);
+ int memcmp(const void *, const void *, uint);
+ void *memcpy(void *, const void *, uint);
++
++int sigalarm(int ticks, void (*handler)());
++int sigreturn(void);
+diff --git a/user/usys.pl b/user/usys.pl
+index 01e426e..5a433e6 100755
+--- a/user/usys.pl
++++ b/user/usys.pl
+@@ -36,3 +36,6 @@ entry("getpid");
+ entry("sbrk");
+ entry("sleep");
+ entry("uptime");
++
++entry("sigalarm");
++entry("sigreturn");
